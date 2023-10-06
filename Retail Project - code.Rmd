@@ -1,0 +1,585 @@
+---
+title: " Retail Project "
+output: html_document
+date: "2023-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(fpp3)
+library(fable)
+library(tsibble)
+```
+
+## Load the data
+
+```{r}
+# Use your student ID as the seed
+set.seed(30806933)
+myseries <- aus_retail |>
+  # Remove discontinued series
+  filter(!(`Series ID` %in% c("A3349561R","A3349883F","A3349499L","A3349902A",
+                        "A3349588R","A3349763L","A3349372C","A3349450X",
+                        "A3349679W","A3349378T","A3349767W","A3349451A"))) |>
+  # Select a series at random
+  filter(`Series ID` == sample(`Series ID`,1))
+```
+
+
+## Question 1: A discussion of the statistical features of the original data. [4 marks]
+
+```{r}
+myseries |> 
+  autoplot(Turnover) +
+  labs(y = "Turnover",
+       title = "Change in Turnover of Victoria over months")
+```
+
+```{r}
+myseries |>
+  ACF(Turnover) |>
+  autoplot() +
+  labs(y = "ACF", 
+       title = "The autocorrelation coefficients for Turnover")
+```
+
+Explanation:
+
+As we can see from the time plot, there is an upward trend in Turnover over months and years. It also appears to be seasonality, and the variance along the plot is not constant. We can also look at the ACF plot of this time series, that the ACFs slowly decays , and r1 is the highest (close to 1). All of these features show that this time serie is not stationary, and we need to perform transformations and differencing in order to make forecasts based on this data. 
+
+## Question 2: Explanation of transformations and differencing used. You should use a unit-root test as part of the discussion. [5 marks]
+
+Transformations help to stabilize the variance and differencing helps to stabilize the mean.
+
+```{r}
+# Perform KPSS test
+myseries |>
+  features(Turnover, unitroot_kpss)
+```
+
+As we use KPSS test, we have:
+Null hypothesis: the data is stationary and non-seasonal.
+In this case, the kpss_pvalue = 0.01, which is less than p-value = 0.05. Therefore, we reject the null hypothesis that the data is stationary and non-seasonal. Since the data is not stationary and non-seasonal, we need to perform transformation and differencing.
+
+First, we take the log transformation to make the variance constant (one of conditions to make data stationary).
+
+```{r}
+# Transformation of the data to stabilize the constant
+myseries |>
+  autoplot(log(Turnover)) +
+  labs(y = "log(Turnover)", 
+       title = "Change in log(Turnover) in Victoria over months")
+```
+
+Next, we will consider number of differencing to make data non-seasonal. We can use unitroot_nsdiffs and unitroot_ndiffs to identify how many differences we should take.
+
+```{r}
+# KPSS test to check now many seasonal differencing we need to use
+myseries |>
+  features(log(Turnover), unitroot_nsdiffs)
+```
+Since the graph have a strong seasonal pattern, we will take the seasonal differencing be done first, and then consider whether to take the first differencing or not. This recommends that we need to take 1 seasonal differencing to make the data stationary.
+
+```{r}
+# After seasonal differencing
+myseries |>
+  autoplot(log(Turnover) |>
+  difference(12)) +
+  labs(y = "log(Turnover)", 
+       title ="Annual change in log(Turnover) of Victoria over months")
+```
+
+It is clearly shown in the graph that the plot is not stationary, that the variance is not constant along time. Therefore, we could use unitroos_ndiffs to check whether we need to take the first differencing.
+
+```{r}
+# KPSS test to check how many normal differencing we need
+myseries |>
+  features(log(Turnover), unitroot_ndiffs)
+```
+Since the result of ndiffs is 1, we should take the first differencing to make data stationary.
+
+```{r}
+# Double differenced graph
+myseries |>
+  autoplot(log(Turnover) |>
+  difference(12) |> 
+    difference(1)) +
+  labs(y = "log(Turnover)", 
+       title = "Doubly differenced log(Turnover) of Victoria")
+```
+
+## Question 3: A description of the methodology used to create a short-list of appropriate ARIMA models and ETS models. Include discussion of AIC values as well as results from applying the models to a test-set consisting of the last 24 months of the data provided. [6 marks]
+
+```{r}
+# Split data into training set and testing set
+test_data <- myseries |>
+  slice_tail(n = 24)
+train_data <- myseries |>
+  slice_head(n = 417)
+```
+
+# Short-list of ARIMA model
+
+```{r}
+# choose the first ARIMA model based on seasonal differencing
+myseries |>
+  gg_tsdisplay(difference(log(Turnover), 12), plot_type = "partial", lag = 36) +
+  labs(title = "Seasonally difference", y = "")
+```
+
+As we take the seasonal differencing, then d = 1.
+- Spikes in PACF at lag 12 suggests seasonal AR(1) term -> P = 1
+- Spikes in PACF suggests non-seasonal AR(2) term -> p = 1. This is because I only chose the significant spikes that
+large and I do not want to make model too complicated, so I ignore the spike at lag 13.
+- The model I choose based on PACF plot is: ARIMA(2,0,0)(1,1,0)[12]
+
+```{r}
+# choose the second ARIMA model based on doubled differenced
+myseries |>
+  gg_tsdisplay(difference(log(Turnover), 12) |> difference(), plot_type = "partial", lag = 36) +
+  labs(title = "Double differenced", y = "")
+```
+
+As we take the seasonal differencing and first differencing, then d = 1 and D = 1
+- Spikes in PACF at lag 12 suggests seasonal AR(2) term -> P = 2. I ignored lag 36 because it is not much significant compared to other seasonal lags
+- Spikes in PACF suggests non-seasonal AR(6) term -> p = 6. This is because I only chose the significant spikes that
+large and I do not want to make model too complex.
+- Spikes in ACF at lag 12 suggests seasonal MA(1) term -> Q = 1. 
+- The model I choose based on PACF plot is: ARIMA(6,1,0)(2,1,1)[12]
+
+```{r}
+# Short-list of ARIMA model
+arima_fit <- train_data |>
+model (arima1 = ARIMA(log (Turnover) ~ 0 + pdq(2,0,0) + PDQ(1,1,0)), # first ARIMA model
+       arima2 = ARIMA(log(Turnover) ~ 0 + pdq (6,1,0) + PDQ(2,1,1)), # second ARIMA model
+       auto_arima = ARIMA(log(Turnover), stepwise = FALSE, approximation = FALSE)) # third ARIMA model chosen by R
+```
+
+My ARIMA model short-list has 3 models, the first and the second I have chosen from ACF and PACF plots, and the last one was chosen by algorithm in R, which I only pass the log(Turnover) into the function and set stepwise = FALSE, approximation = FALSE, to make R work harder to choose the best model. All three models were trained by the training data set, which I created from previous step.
+
+```{r}
+# Using pivot longer to make models easier to compare
+arima_fit |>
+  pivot_longer(!c(State, Industry), names_to = "Model name",
+                 values_to = "Orders")
+```
+
+```{r}
+# Extract the AICc values to compare models
+glance(arima_fit) |> arrange(AICc) |> select(.model:BIC)
+```
+
+We can compare how well the models perform by looking at their AICc values, the smaller the AICc value is, the better the model performs. As we can see from the table, the model that was chosen by R performs best (AICc value = -1187.613), followed by arima2 (AICc value = -1173.456) and then arima1 (AICc value = -1088.496). Model 'auto_arima' and 'arima2' have close AICc value, so their performance in forecasting should not be really different.
+
+```{r}
+# Apply the forecast on the test_data
+arima_fit |>
+  forecast(.model = "auto") |>
+  autoplot(test_data) +
+  labs(title = "Forecasts of ARIMA models on the test data")
+```
+
+This graph shows how well these models forecast in the test data. As we can see, the blue line, which is model 'auto_arima', is the closest line to the black line. Therefore, in this case, 'auto_arima' is performing the best.
+
+```{r}
+# Accuracy metrics to evaluate the performance of models
+arima_fit |>
+  forecast(h = 24) |>
+  accuracy(test_data)
+```
+
+When applying to the test set, we can see that model 'auto_arima' performs best, compared to the others, since its ME, RMSE, MAE, is the lowest among all models. The error in forecasting of that model is the lowest. Therefore, I choose it to be my best arima model: ARIMA(3,0,2)(0,1,1)[12] w/ drift
+
+# Short-list of ETS model
+
+```{r}
+# Plot of original training data
+train_data |>
+  autoplot(Turnover) +
+  labs(title = "Change in Turnover",
+       y = "Turnover")
+```
+
+As we can see, there are both trend and seasonality appear in the data. Therefore we need to specify whether to use multiplicative/additive trend and multiplicative/additive seasonality in the ETS model, as well as the error terms. 
+Since the variance of data is increase proportional with the level of the series, I would consider the following cases:
+1. ETS(M,A,A)
+2. ETS(M,Ad,M)
+
+```{r}
+# Short-list of ETS model
+ets_fit <- train_data |>
+  model(ets1 = ETS(Turnover ~ error("M") + trend("A") + season("A")),
+        ets2 = ETS(Turnover ~ error("M") + trend("Ad") + season("M")),
+        auto_ets = ETS(Turnover))
+```
+
+My ETS model short-list has 3 models, the first and the second I have chosen based on the plot, and the last one was chosen by algorithm in R, which I only pass the Turnover into the function. All three models were trained by the training data set, which I created from previous step.
+
+```{r}
+# Using pivot longer to make models easier to compare
+ets_fit |>
+  pivot_longer(!c(State, Industry), names_to = "Model name",
+                 values_to = "Orders")
+```
+As we can see, the model 2 that I have chosen is not really different from the model that R chose, except the trend is Damped trend.
+
+```{r}
+# Extract the AICc values to compare models
+glance(ets_fit) |> arrange(AICc) |> select(.model:BIC)
+```
+
+We can compare how well the models perform by looking at their AICc values, the smaller the AICc value is, the better the model performs. As we can see from the table, the model that was chosen by R performs best (AICc value = 4135.816), followed by ets2 (AICc value = 4143.241) and then ets1 (AICc value = 4574.776). Model 'auto_ets' and 'ets2' have close AICc value, so their performance in forecasting should not be really different.
+
+```{r}
+# Apply the forecast on the test data
+ets_fit |>
+  forecast(.model = "auto") |>
+  autoplot(test_data) +
+  labs(title = "Forecast of ETS models on the test set")
+```
+
+This graph shows different result to the AICc values. That the model which has highest AICc performs best (ets1), since its green line is really close to the black line. The other two are quite far from the actual data.
+
+```{r}
+# Accuracy metrics to evaluate the performance of models
+ets_fit |>
+  forecast(h = 24) |>
+  accuracy(test_data)
+```
+
+As we use different metrics to compare models, we could see that the 'auto_ets' model does not perform the best anymore, since its metrics are really high, almost double the metrics of model ets1. Therefore, I would choose the 'ets1' as my best model, based on metrics such as ME, RMSE, MAE, etc.
+
+## Question 4: Choose one ARIMA model and one ETS model based on this analysis and show parameter estimates, residual diagnostics, forecasts and prediction intervals for both models. Diagnostic checking for both models should include ACF graphs and the Ljung-Box test. [8 marks]
+
+# ARIMA model
+
+```{r}
+# parameter estimates
+arima_best <- arima_fit |>
+  select(auto_arima) |>
+report(arima_best)
+```
+Coefficients:
+- ar1, ar2, ar3: These coefficients represent the autoregressive parameters for the non-seasonal component of the ARIMA model. In this case, the model includes lag 1, lag 2, and lag 3.
+- ma1, ma2: These coefficients represent the moving average parameters for the non-seasonal component of the ARIMA model. In this case, the model includes lag 1 and lag 2.
+- sma1: This coefficient represents the seasonal moving average parameter for the seasonal component of the ARIMA model.
+- constant: This coefficient represents the drift term in the ARIMA model, which captures any systematic linear trend or bias in the data.
+
+```{r}
+# Residual diagnostics
+gg_tsresiduals(arima_best) +
+  labs(title = "Residual diagnostics")
+```
+
+As we can see from the graphs above, I would conclude that the error of this model is stationary and also white-noise, since there's no autocorrelation the ACF plot, even when there is one significant lag. The innovative residuals also shows a constant variance in different level of the serie. And the .resid histogram show that the error is Normal distribution. So the error in this model is white-noise.
+
+```{r}
+# Ljung-box test
+augment(arima_best) |>
+  features(.innov, ljung_box, lag = 36, dof = 6)
+```
+As the lb_pvalue is 0.107, which is > 0.05. Therefore, we fail to reject the null hypothesis and conclude that there's no autocorrelation in the residuals. Therefore, the model is reliable to be used to forecast.
+
+```{r}
+# Forecast of best arima model 
+best_arima <- train_data |>
+  model(arima = ARIMA(log(Turnover), stepwise = FALSE, approximation = FALSE)) |>
+  forecast(h = 24) |>
+  autoplot(myseries) + 
+  labs(title = "Forecast of ARIMA(3,0,2)(0,1,1)[12] w/ drift on the full data")
+best_arima
+```
+
+As we can see from the graph, the forecast of the best arima model is similar to the actual data. The forecasting line and the actual data line almost match each other.
+
+```{r}
+# Prediction interval of the forecast
+arima_interval <- train_data |>
+  model(arima = ARIMA(log(Turnover), stepwise = FALSE, approximation = FALSE)) |>
+  forecast(h = 24) |>
+  hilo()
+arima_interval
+```
+
+Since the residual is white-noise, the estimated mean of the time series is likely to be an unbiased estimate of the true mean and the prediction intervals are likely to be symmetric and capture the random variability of the future observations. This allows for more reliable and accurate estimation of the uncertainty associated with the forecasted values. 
+In this case, even though the residual is white-noise, there's still some uncertainty in the forecast, as we can see the width of prediction intervals are quite large in some months. 
+
+# ETS model
+
+```{r}
+# parameter estimates
+ets_best <- ets_fit |>
+  select(ets1) |>
+report(ets_best)
+```
+The model estimates the smoothing parameters that control the weight given to the most recent observations and the rate at which the model adapts to changes. The values reported here are:
+- Alpha: The smoothing parameter for the level component (trend).
+- Beta: The smoothing parameter for the trend component.
+- Gamma: The smoothing parameter for the seasonal component.
+
+Initial States: These are the initial values for the level (l), trend (b), and seasonal (s) components. The initial states are essential for initializing the model. The values reported here are the initial states for each component at time t = 0 and for several preceding time points (s[-1], s[-2], etc.). These values are estimated based on the data and play a role in the model's forecasting.
+
+```{r}
+# Residual plot
+gg_tsresiduals(ets_best) +
+  labs(title = "Residual diagnostics")
+```
+
+The ACF plot suggests that there's autocorrelation appears in the data, as the correlations are sinusoidal. There's a constant variance in different level of the series, except the beginning of the graph. 
+
+```{r}
+# Ljung-box test
+augment(ets_best) |>
+  features(.innov, ljung_box, lag = 10)
+```
+Since the graphs above suggest the autocorrelations, therefore when we do the Ljung-box test, we would reject the null hypothesis and conclude that there's autocorrelation in the residuals, since the lb_value is 0, which is < 0.05.
+
+```{r}
+# Forecast of best ETS model 
+best_ets <- train_data |>
+  model(ets = ETS(Turnover ~ error("M") + trend("A") + season("A"))) |>
+  forecast(h = 24) |>
+  autoplot(myseries) +
+  labs(title = "Forecast of model ETS(M,A,A) on the full data set")
+best_ets
+```
+
+```{r}
+# Prediction interval of the forecast
+ets_interval <- train_data |>
+  model(ets = ETS(Turnover ~ error("M") + trend("A") + season("A"))) |>
+  forecast(h = 24) |>
+  hilo()
+ets_interval
+```
+
+Even when there's autocorrelations in the data, but ETS model can handle the non-stationary data. It can still perform well with the autocorrelations. The graph above shows that the actual line and the forecasting line is really close to each other. Therefore, the performance of this ETS model is not too bad in my opinion, even when it does not pass the Ljung-box test, since its really hard for a model to satisfy every conditions. There's still some uncertainty in the forecast, as we can see the width of prediction intervals are quite large in some months.
+
+# Question 5: Comparison of the results from each of your preferred models. Which method do you think gives the better forecasts? Explain with reference to the test-set. [2 marks]
+
+```{r}
+# Plot the forecast the the best ARIMA model against the test set
+best_arima <- train_data |>
+  model(arima = ARIMA(log(Turnover), stepwise = FALSE, approximation = FALSE)) |>
+  forecast(h = 24) |>
+  autoplot(test_data) +
+  labs(title = "Comparison between the ARIMA model forecast and test set")
+best_arima
+```
+
+```{r}
+# Check the accuracy in forecasting of ARIMA model using the test set
+arima_accuracy <- arima_fit |>
+  forecast(h = 24) |>
+  accuracy(test_data)
+arima_accuracy |>
+  filter(.model == "auto_arima")
+```
+
+```{r}
+# Plot the forecast the the best ETS model against the test set
+best_ets <- train_data |>
+  model(ets = ETS(Turnover ~ error("M") + trend("A") + season("A"))) |>
+  forecast(h = 24) |>
+  autoplot(test_data) +
+  labs(title = "Comparison between the ETS model forecast and the test set")
+best_ets
+```
+
+```{r}
+# Check the accuracy in forecasting of ETS model using the test set
+ets_accuracy <- ets_fit |>
+  forecast(h = 24) |>
+  accuracy(test_data)
+ets_accuracy |>
+  filter(.model == "ets1")
+```
+As these graphs show us, the forecast of ETS model seems to be closer to the actual data.
+The accuracy metrics used of these two models are really similar, that the values for ARIMA model are always higher than those of ETS model a little bit, except the Mean Error.The ME represents the average error or bias of the forecasted values. It is calculated as the mean of the forecast errors (residuals). Usually we want ME to be close to 0. The ME of model 'ets1' is 4.2 (really close to 0), while the figure for arima model is 16.9. There is a large gap between these numbers.
+Therefore, I would say that ETS model performs better than ARIMA model, but not too much.
+
+# Question 6: Apply your two chosen models to the full data set, re-estimating the parameters but not changing the model structure. Produce out-of-sample point forecasts and 80% prediction intervals for each model for two years past the end of the data provided. [4 marks]
+
+```{r}
+# Re-estimate the parameters of the model with the full data set
+arima_model <- myseries |>
+  model(arima = ARIMA(log (Turnover) ~ 1 + pdq(3,0,2) + PDQ(0,1,1))) |>
+report(arima_model)
+```
+```{r}
+# 80% prediction intervals and point forecast 
+arima_model |>
+  forecast(h = 24, level = 80) |>
+  hilo() |>
+  select(c("80%", ".mean"))
+```
+
+```{r}
+# Forecast of ARIMA model for the next 2 years
+arima_model |>
+  forecast(h = 24, level = 80) |>
+  autoplot(myseries) +
+  labs(title = "Forecast of ARIMA model for period 2019-2020")
+```
+
+```{r}
+# Re-estimate the parameters of the model with the full data set
+ets_model <- myseries |>
+  model(ets = ETS(Turnover ~ error("M") + trend("A") + season("A"))) |>
+report(ets_model)
+```
+
+```{r}
+# 80% prediction intervals and point forecast
+ets_model |>
+  forecast(h = 24, level = 80) |>
+  hilo() |>
+  select(c("80%", ".mean"))
+```
+
+```{r}
+# Forecast of ETS model for the next 2years
+ets_model |>
+  forecast(h = 24, level = 80) |>
+  autoplot(myseries) +
+  labs(title = "Forecast of ETS model for the period 2019-2020")
+```
+
+
+## Question 7: Obtain up-to-date data from the ABS website (https://www.abs.gov.au/statistics/industry/retail-and-wholesale-trade/retail-trade-australia Table 11). You may need to use the previous release of data, rather than the latest release. Compare your forecasts with the actual numbers. How well did you do? [5 marks]
+
+# ARIMA model
+
+```{r}
+# read the new data
+new_data <- readxl::read_excel("8501011.xls", sheet = "Data1", skip = 9) |>
+  select(Month = `Series ID`, Turnover = myseries$`Series ID`[1]) |>
+  mutate(
+    Month = yearmonth(Month),
+    State = myseries$State[1],
+    Industry = myseries$Industry[1]
+  ) |>
+  as_tsibble(index = Month, key = c(State, Industry))
+```
+
+```{r}
+# Get data of 2019-2020 in order to compare
+data_compare <- new_data |>
+  slice_tail(n = 24)
+```
+
+```{r}
+# Check the accuracy of ARIMA model using the new data
+arima_model |>
+  forecast(h = 24, level = 80) |>
+  accuracy(data_compare)
+```
+
+```{r}
+# Plot the difference between actual data and forecast
+arima_model |>
+  forecast(h = 24, level = 80) |>
+  autoplot(data_compare) +
+  labs(title = "Comparison of the actual data and the forecast")
+```
+
+```{r}
+# Get the point forecast of ARIMA model
+arima_mean <- arima_model |>
+  forecast(h = 24, level = 80) |>
+  hilo() |>
+  select(.mean)
+```
+
+```{r}
+# Compare the actual numbers and the point forecast
+full_join(data_compare, arima_mean, by = "Month") |>
+  select(-c(State, Industry))
+```
+
+We will compare the mean (point forecast) and the actual numbers. As we can see from the graph and also the numbers, the ARIMA model is not doing well in forecasting the next 2 years, since the actual numbers and arima model's numbers are quite different, that the forecast is higher than the actual value a lot. There are only few months in early 2019 that the forecast is accurate. The metrics also show that there's a lot of difference in the forecast compared to the actual data.
+
+# ETS model
+
+```{r}
+# Check the accuracy in forecasting of ETS model using new data
+ets_model |>
+  forecast(h = 24, level = 80) |>
+  accuracy(data_compare)
+```
+
+```{r}
+# Plot a graph the show the difference between actual data and the forecast
+ets_model |>
+  forecast(h = 24, level = 80) |>
+  autoplot(data_compare) +
+  labs(title = "Comparison of the actual data and the forecast")
+```
+
+```{r}
+# Select the point forecast of the ETS model
+ets_mean <- ets_model |>
+  forecast(h = 24, level = 80) |>
+  hilo() |>
+  select(.mean)
+```
+
+```{r}
+# # Compare the actual numbers and the point forecast
+full_join(data_compare, ets_mean, by = "Month") |>
+  select(-c(State, Industry))
+```
+
+We will compare the mean (point forecast) and the actual numbers. ETS model also does not perform well in this forecast, since the graph and also the table above show a large difference between the forecast and the actual numbers. The forecast numbers are higher than the actual numbers. There is a big gap between two lines in the graph. The accuracy metrics also determine that this model is not doing well in forecasting, since the errors are quite high.
+
+Despite the accuracy these two model have in previous forecast, both of these does not perform really well in forecasting the next 2 years. 
+
+## Question 8: A discussion of benefits and limitations of the models for your data. [3 marks]
+
+Despite the accuracy these two model have in previous forecast, both of these does not perform really well in forecasting the next 2 years. 
+
+1. ARIMA(3,0,2)(0,1,1)[12] with drift:
+Benefits:
+The ARIMA model allows for the inclusion of autoregressive (AR) and moving average (MA) components, as well as seasonal differencing. This flexibility allows the model to capture different patterns and dependencies in the data. The inclusion of seasonal parameters in the model ([12] in this case) helps capture and forecast seasonal patterns in the data. A drift term accounts for a constant trend or long-term growth/decline in the data. In this case, both seasonality, (constant) trend of the data are captured in the structure of the model.
+
+Limitations:
+This ARIMA model is complex with multiple AR and MA terms. Interpreting the coefficients and understanding their impact on the data can be challenging. 
+
+2. ETS(M,A,A):
+Benefits:
+The ETS model is based on exponential smoothing methods, which provide a simple and intuitive approach to capturing trends and seasonality in the data. The model automatically adjusts the smoothing parameters (alpha, beta, gamma) to the changing patterns in the data, allowing for adaptability to different time series characteristics.  
+
+Limitations:
+The performance of ETS models relies heavily on accurate estimation of the smoothing parameters. In order to have a good model, we need to estimate the parameters appropriately, and this would be hard and time-consuming. This ETS models assume that the seasonality is additive. In cases where the seasonality is multiplicative, ETS models may not capture it effectively.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
